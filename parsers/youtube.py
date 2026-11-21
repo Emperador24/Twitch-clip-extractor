@@ -42,6 +42,8 @@ class YouTubeParser(ChatParser):
         Returns:
             Ruta al archivo JSON descargado
         """
+        import tempfile
+
         # Extraer video_id de la URL
         video_id = self._extract_video_id(self.source)
         if not video_id:
@@ -49,30 +51,35 @@ class YouTubeParser(ChatParser):
 
         self.video_id = video_id
 
-        # Crear nombre de archivo temporal
-        base_name = f"youtube_{video_id}"
+        # Descargar en tempdir para no contaminar el repo
+        tmpdir = tempfile.gettempdir()
+        base_name = str(Path(tmpdir) / f"youtube_{video_id}")
 
-        # Descargar chat con yt-dlp
+        # Descargar chat con yt-dlp (flag correcto: --sub-langs)
         cmd = [
             "yt-dlp",
             "--write-subs",
-            "--sub-lang", "live_chat",
+            "--sub-langs", "live_chat",
             "--skip-download",
+            "--ignore-config",
             "-o", base_name,
+            "--",
             self.source,
         ]
 
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timeout descargando chat de YouTube (>300s)")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Error descargando chat de YouTube: {e.stderr.decode()}")
 
-        # Buscar archivo .live_chat.json generado
-        chat_file = Path(f"{base_name}.en.live_chat.json")
-        if not chat_file.exists():
-            raise FileNotFoundError(f"No se generó chat JSON: {chat_file}")
+        # Buscar archivo .live_chat.json generado (puede tener diferentes prefijos)
+        json_files = list(Path(tmpdir).glob(f"{Path(base_name).name}*.live_chat.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No se generó chat JSON para: {video_id}")
 
-        return str(chat_file)
+        return str(json_files[0])
 
     def _extract_video_id(self, url: str) -> str:
         """Extrae el video_id de una URL de YouTube."""
@@ -89,44 +96,67 @@ class YouTubeParser(ChatParser):
     def _parse_chat_json(self, chat_file: str) -> Tuple[List[Tuple[float, str]], str]:
         """Parsea el archivo JSON de chat.
 
-        El formato de yt-dlp para live_chat es complejo, extraemos timestamps y mensajes.
+        yt-dlp escribe JSON Lines (una línea por objeto JSON).
+        Cada línea puede ser un evento con replayChatItemAction.
         """
-        with open(chat_file, encoding="utf-8") as f:
-            data = json.load(f)
-
         messages = []
 
-        # Formato de yt-dlp: array de eventos, cada uno con 'replayChatItemAction'
-        for event in data.get("events", []):
-            if "replayChatItemAction" in event:
-                item = event["replayChatItemAction"].get("actions", [{}])[0]
+        try:
+            with open(chat_file, encoding="utf-8") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
 
-                # Buscar mensaje de chat
-                if "addChatItemAction" in item:
-                    chat_item = item["addChatItemAction"].get("item", {})
-                    msg_data = chat_item.get("liveChatMessageRenderer", {})
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                    timestamp_text = msg_data.get("timestampText", {}).get("simpleText", "")
-                    message_text = ""
+                    # Formato de yt-dlp: replayChatItemAction contiene actions
+                    if "replayChatItemAction" in event:
+                        actions = event["replayChatItemAction"].get("actions", [])
+                        for action in actions:
+                            msg = self._extract_message_from_action(action)
+                            if msg:
+                                timestamp, text = msg
+                                if timestamp is not None and text:
+                                    messages.append((float(timestamp), text))
 
-                    # Extraer texto del mensaje
-                    runs = msg_data.get("message", {}).get("runs", [])
-                    for run in runs:
-                        message_text += run.get("text", "")
+        except (IOError, json.JSONDecodeError) as e:
+            raise ValueError(f"Error leyendo archivo de chat: {e}")
 
-                    # Convertir timestamp "HH:MM:SS" a segundos
-                    if timestamp_text and message_text:
-                        seconds = self._parse_timestamp(timestamp_text)
-                        if seconds is not None:
-                            messages.append((float(seconds), message_text))
-
-        # Si no encontramos mensajes con esta estructura, intentar formato alternativo
-        if not messages:
-            messages = self._parse_chat_legacy(data)
-
-        video_id = self.video_id or self._extract_video_id_from_chat(data)
+        video_id = self.video_id
 
         return messages, video_id
+
+    def _extract_message_from_action(self, action: dict) -> Tuple[int, str]:
+        """Extrae timestamp y texto de un action."""
+        if "addChatItemAction" not in action:
+            return None
+
+        chat_item = action["addChatItemAction"].get("item", {})
+        msg_data = chat_item.get("liveChatMessageRenderer", {})
+
+        if not msg_data:
+            return None
+
+        timestamp_text = msg_data.get("timestampText", {}).get("simpleText", "")
+        message_text = ""
+
+        # Extraer texto del mensaje
+        runs = msg_data.get("message", {}).get("runs", [])
+        for run in runs:
+            if isinstance(run, dict):
+                message_text += run.get("text", "")
+
+        # Convertir timestamp "HH:MM:SS" a segundos
+        if timestamp_text and message_text:
+            seconds = self._parse_timestamp(timestamp_text)
+            if seconds is not None:
+                return (seconds, message_text)
+
+        return None
 
     def _parse_timestamp(self, timestamp_str: str) -> int:
         """Convierte timestamp "HH:MM:SS" o "MM:SS" a segundos."""
@@ -138,24 +168,6 @@ class YouTubeParser(ChatParser):
             elif len(parts) == 2:
                 m, s = map(int, parts)
                 return m * 60 + s
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, TypeError):
             pass
-        return None
-
-    def _parse_chat_legacy(self, data: dict) -> List[Tuple[float, str]]:
-        """Fallback para parsear formato alternativo de chat."""
-        messages = []
-        for item in data.get("items", []):
-            if "id" in item and "message" in item:
-                # Formato simple
-                msg = item.get("message", "")
-                if msg:
-                    messages.append((0.0, msg))
-        return messages
-
-    def _extract_video_id_from_chat(self, data: dict) -> str:
-        """Intenta extraer video_id de los datos del chat."""
-        # Algunos formatos pueden incluir metadata del video
-        if "videoDetails" in data:
-            return data["videoDetails"].get("videoId")
         return None

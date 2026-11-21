@@ -39,51 +39,27 @@ class KickParser(ChatParser):
     def _download_chat(self) -> str:
         """Descarga el chat de un video de Kick con yt-dlp.
 
-        Nota: Kick tiene limitaciones con chat público. Este método
-        intenta descargar subtitle/chat info disponible.
+        LIMITACIÓN: Kick tiene muy limitadas las APIs públicas de chat.
+        yt-dlp no puede descargar chat de Kick directamente.
 
         Returns:
             Ruta al archivo JSON descargado
+
+        Raises:
+            RuntimeError: Kick chat no está disponible públicamente
         """
-        # Extraer video_id de la URL o usar un hash
         video_id = self._extract_video_id(self.source)
         if not video_id:
-            # Si no se puede extraer, usar un hash de la URL
-            import hashlib
-            video_id = hashlib.md5(self.source.encode()).hexdigest()[:16]
+            raise ValueError(f"No se pudo extraer video_id de Kick: {self.source}")
 
         self.video_id = video_id
 
-        # Crear nombre de archivo temporal
-        base_name = f"kick_{video_id}"
-
-        # Intentar descargar con yt-dlp
-        # Nota: Kick no siempre tiene chat público disponible
-        cmd = [
-            "yt-dlp",
-            "--write-subs",
-            "--skip-download",
-            "-o", base_name,
-            self.source,
-        ]
-
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            # Si falla, puede ser que el chat no esté disponible
-            raise RuntimeError(
-                f"Error descargando info de Kick: {e.stderr.decode()}\n"
-                "Nota: Algunos videos de Kick pueden no tener chat público disponible."
-            )
-
-        # Buscar cualquier archivo JSON generado
-        json_files = list(Path(".").glob(f"{base_name}*.json"))
-        if json_files:
-            return str(json_files[0])
-
-        raise FileNotFoundError(
-            f"No se generó chat JSON para Kick: {video_id}.\n"
-            "El video puede no tener chat disponible públicamente."
+        # Kick no proporciona chat públicamente vía yt-dlp
+        raise RuntimeError(
+            f"❌ Chat de Kick no disponible: Kick no expone chat públicamente.\n"
+            f"   Los videos de Kick pueden no tener chat descargable.\n"
+            f"   Considera usar un archivo JSON de chat local si lo tienes disponible.\n"
+            f"   Video: {self.source}"
         )
 
     def _extract_video_id(self, url: str) -> str:
@@ -99,9 +75,8 @@ class KickParser(ChatParser):
         with open(chat_file, encoding="utf-8") as f:
             try:
                 data = json.load(f)
-            except json.JSONDecodeError:
-                # Si no es JSON, intenta parsear como texto plano
-                return self._parse_chat_text(chat_file)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Archivo de chat no es JSON válido: {e}")
 
         messages = []
 
@@ -110,33 +85,33 @@ class KickParser(ChatParser):
         if isinstance(data, list):
             for msg_obj in data:
                 if isinstance(msg_obj, dict):
-                    timestamp = msg_obj.get("timestamp", 0)
-                    text = msg_obj.get("message") or msg_obj.get("text") or ""
-                    if text:
-                        messages.append((float(timestamp), text))
+                    timestamp = msg_obj.get("timestamp")
+                    text = msg_obj.get("message") or msg_obj.get("text")
+
+                    # Validar tipos y convertir timestamp
+                    try:
+                        if timestamp is not None and text:
+                            if isinstance(text, str):
+                                messages.append((float(timestamp), text))
+                    except (ValueError, TypeError):
+                        continue
 
         # Formato 2: Objeto con 'messages' o 'chat'
         elif isinstance(data, dict):
             chat_data = data.get("messages") or data.get("chat") or data.get("events")
-            if chat_data:
-                for msg_obj in chat_data if isinstance(chat_data, list) else []:
-                    timestamp = msg_obj.get("timestamp", 0)
-                    text = msg_obj.get("message") or msg_obj.get("text") or ""
-                    if text:
-                        messages.append((float(timestamp), text))
+            if chat_data and isinstance(chat_data, list):
+                for msg_obj in chat_data:
+                    if isinstance(msg_obj, dict):
+                        timestamp = msg_obj.get("timestamp")
+                        text = msg_obj.get("message") or msg_obj.get("text")
 
-        return messages, self.video_id
+                        try:
+                            if timestamp is not None and text:
+                                if isinstance(text, str):
+                                    messages.append((float(timestamp), text))
+                        except (ValueError, TypeError):
+                            continue
+        else:
+            raise ValueError(f"Formato de chat desconocido: {type(data)}")
 
-    def _parse_chat_text(self, chat_file: str) -> Tuple[List[Tuple[float, str]], str]:
-        """Fallback para parsear chat en formato texto simple."""
-        messages = []
-        try:
-            with open(chat_file, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if line:
-                        # Asumir formato simple: timestamp y mensaje separados
-                        messages.append((float(line_num * 10), line))
-        except Exception:
-            pass
         return messages, self.video_id

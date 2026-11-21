@@ -22,30 +22,60 @@ import sys
 def extraer_info_url(url):
     """Extrae la plataforma y video ID de una URL.
 
+    Args:
+        url: URL de Twitch, YouTube o Kick
+
     Returns:
         (plataforma, video_id) o (None, None) si no es válida
     """
+    from urllib.parse import urlparse
+
     url = url.strip()
 
+    # Parsear URL para validar
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None, None
+
+    # Validar que sea HTTP/HTTPS
+    if parsed.scheme not in {"http", "https"}:
+        return None, None
+
+    hostname = parsed.hostname or ""
+
     # Twitch
-    match = re.search(r"twitch\.tv/videos/(\d+)", url)
-    if match:
-        return "twitch", match.group(1)
+    if "twitch.tv" in hostname:
+        match = re.search(r"twitch\.tv/videos/(\d+)", url)
+        if match:
+            video_id = match.group(1)
+            # Validar que sea solo dígitos (6+)
+            if re.fullmatch(r"\d{6,}", video_id):
+                return "twitch", video_id
+        return None, None
 
     # YouTube
-    match = re.search(r"(?:youtube\.com/watch\?v=|youtu\.be/)([^&\n?#]+)", url)
-    if match:
-        return "youtube", match.group(1)
+    if "youtube.com" in hostname or "youtu.be" in hostname:
+        # Validar que el video ID sea correcto
+        match = re.search(r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]+)", url)
+        if match:
+            video_id = match.group(1)
+            # YouTube IDs son exactamente 11 caracteres alphanumeric + - _
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                return "youtube", video_id
+        return None, None
 
-    # Kick - múltiples formatos
-    # Formato 1: https://kick.com/video/xyz789
-    match = re.search(r"kick\.com/video/([^/?&\n]+)", url)
-    if match:
-        return "kick", match.group(1)
-    # Formato 2: https://kick.com/username/videos/uuid-style-id
-    match = re.search(r"kick\.com/[^/]+/videos/([^/?&\n]+)", url)
-    if match:
-        return "kick", match.group(1)
+    # Kick
+    if "kick.com" in hostname:
+        # Formato 1: https://kick.com/video/xyz789
+        match = re.search(r"kick\.com/video/([A-Za-z0-9_-]+)", url)
+        if match:
+            return "kick", match.group(1)
+        # Formato 2: https://kick.com/username/videos/uuid-style-id
+        match = re.search(r"kick\.com/[^/]+/videos/([A-Za-z0-9_-]+)", url)
+        if match:
+            return "kick", match.group(1)
+        return None, None
 
     return None, None
 
