@@ -1,0 +1,8 @@
+# Twitch Clip Extractor - Requirements
+#
+# Sistema (instalar con brew):
+# - brew install python yt-dlp ffmpeg
+# - Descargar TwitchDownloaderCLI de: https://github.com/lay295/TwitchDownloader/releases
+#
+# Este proyecto usa solo librerías estándar de Python 3.9+
+# No hay dependencias externas de pip necesarias
